@@ -35,7 +35,7 @@ Do not solve prefix instability independently in each provider adapter. Produce 
   - never represent a context change by rewriting the system prompt, replacing an earlier context message, or mutating a checkpoint root.
 - Give every appended context update a unique event identity. Compare the latest context by content, not only by identifier, so `A → B → A` appends the final `A` again while retries of the same event remain idempotent.
 - Preserve `request-context:*` wire identity through checkpoint encoding and hydration. Deduplication must still work after process restart or conversation resume.
-- Automatic compaction is an explicit prefix reset. Compact obsolete history, retain exactly the latest request-context message, then place the summary and current initial messages in deterministic order. Manual compaction may reproject current context on the next user turn.
+- Automatic compaction is an explicit prefix reset. Compact the obsolete prefix, retain a recent unsummarized tail (`window_tail`) plus the latest request-context message, then place the summary, tail, and current initial messages in deterministic order. Manual compaction may reproject current context on the next user turn.
 - Background completions and injected runtime events must not manufacture duplicate request context unless they actually start a user turn whose context changed.
 
 ## Change workflow
@@ -64,7 +64,7 @@ Cover the affected behavior with structural assertions, not token-count estimate
 - Context reversion `A → B → A`: three distinct context events are retained in order.
 - Retry of one runtime event: no duplicate or conflicting context message is persisted.
 - Checkpoint round-trip: request-context identity and content survive encode/hydrate.
-- Automatic compaction: only the latest context is retained outside the summary.
+- Automatic compaction: the latest request-context and a recent unsummarized tail are retained outside the summary.
 - Runtime templates render without embedding conversation-level rules or MCP metadata in every user query.
 
 Run focused tests first, then the relevant server suites:
