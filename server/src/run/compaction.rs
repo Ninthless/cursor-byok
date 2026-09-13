@@ -319,6 +319,7 @@ pub(super) fn replacement(
 }
 
 const COMPACTED_FILE_WINDOW: &str = "[compacted file window]";
+const COMPACTED_IDENTITY_SUFFIX: &str = ":compacted-file-window";
 
 fn is_file_window(message: &CanonicalMessage) -> bool {
     match &message.content {
@@ -373,7 +374,21 @@ fn shrink_file_window(mut message: CanonicalMessage) -> CanonicalMessage {
         }
         _ => {}
     }
+    // Checkpoint messages are immutable by id. Keep the shrunk body on a new
+    // identity so replace_checkpoint does not hit "reused with different content".
+    retarget_compacted_identity(&mut message);
     message
+}
+
+fn retarget_compacted_identity(message: &mut CanonicalMessage) {
+    if !message.message_id.ends_with(COMPACTED_IDENTITY_SUFFIX) {
+        message.message_id.push_str(COMPACTED_IDENTITY_SUFFIX);
+    }
+    if let Some(event_id) = &mut message.runtime_event_id {
+        if !event_id.ends_with(COMPACTED_IDENTITY_SUFFIX) {
+            event_id.push_str(COMPACTED_IDENTITY_SUFFIX);
+        }
+    }
 }
 
 fn strip_selected_context(text: &str) -> String {
@@ -743,8 +758,10 @@ mod tests {
             "summarizer must see the file window"
         );
         assert!(
-            plan.tail.iter().any(|message| message.message_id == "u2"),
-            "recent query stays in the tail"
+            plan.tail.iter().any(|message| {
+                message.message_id != "u2" && message_text(message).contains("recent work")
+            }),
+            "recent query stays in the tail under a new identity"
         );
         assert!(
             plan.tail
@@ -760,7 +777,7 @@ mod tests {
         assert!(assembled
             .iter()
             .all(|message| !message_text(message).contains("secret-file-body")));
-        assert!(assembled.iter().any(|message| message.message_id == "u2"));
+        assert!(assembled.iter().all(|message| message.message_id != "u2"));
         assert!(assembled.iter().any(|message| message.message_id == "u3"));
     }
 
@@ -785,11 +802,51 @@ mod tests {
         );
         let slim = assembled
             .iter()
-            .find(|message| message.message_id == "u2")
+            .find(|message| message_text(message).contains("continue"))
             .unwrap();
+        assert_ne!(slim.message_id, "u2");
         assert!(message_text(slim).contains("continue"));
         assert!(!message_text(slim).contains("current-file-body"));
         assert!(!message_text(slim).contains("<selected_context>"));
+    }
+
+    #[test]
+    fn shrinking_file_windows_does_not_reuse_a_persisted_identity() {
+        let mut current = file_window_user(
+            "cursor-root:N5ZiHeATMhBKSyUyDvOkWZ2Br3ygG+guJez/HoE0lqo=:4",
+            "continue",
+            "current-file-body",
+        );
+        current.runtime_event_id = Some(current.message_id.clone());
+        let original_id = current.message_id.clone();
+        let original_event = current.runtime_event_id.clone();
+        let old = CanonicalMessage::text("u1", Role::User, Origin::Runtime, "x".repeat(200_000));
+        let old_answer = CanonicalMessage::text("a1", Role::Assistant, Origin::Assistant, "old");
+        let messages = vec![old, old_answer, current.clone()];
+        let current_ids = ids(std::slice::from_ref(&current));
+        let mut prepared = prepared(50_000);
+        prepared.initial_messages = vec![current.clone()];
+
+        let plan = plan(&messages, &current_ids, &prepared, CompactionKind::Auto).unwrap();
+        let assembled = replacement(
+            &plan,
+            summary_message("s".into(), "current files summarized"),
+            &prepared.initial_messages,
+        );
+        for message in &assembled {
+            let same_id =
+                message.message_id == original_id || message.runtime_event_id == original_event;
+            assert!(
+                !same_id,
+                "shrunk replacement reused {}:{}",
+                message.message_id,
+                message.runtime_event_id.as_deref().unwrap_or("-")
+            );
+        }
+        assert!(assembled.iter().any(|message| {
+            message.message_id.ends_with(COMPACTED_IDENTITY_SUFFIX)
+                && message_text(message).contains("continue")
+        }));
     }
 
     fn message_text(message: &CanonicalMessage) -> String {
