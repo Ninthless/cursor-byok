@@ -272,6 +272,8 @@ impl Store {
         Ok(())
     }
 
+    /// Compaction calls send an empty tool list; their token usage is not the
+    /// remaining conversation prompt and must not become the next turn's anchor.
     pub(crate) async fn latest_context_usage(
         &self,
         conversation_id: &str,
@@ -280,6 +282,7 @@ impl Store {
             "SELECT usage_json, message_count FROM llm_calls
              WHERE conversation_id = ?
                AND json_extract(usage_json, '$.context_input_tokens') IS NOT NULL
+               AND tool_count > 0
              ORDER BY created_at_ms DESC, rowid DESC
              LIMIT 1",
         )
@@ -490,7 +493,7 @@ mod tests {
                     reasoning_effort: None,
                     fast: false,
                     message_count,
-                    tool_count: 0,
+                    tool_count: 1,
                     detailed: false,
                 })
                 .await
@@ -518,5 +521,64 @@ mod tests {
             })
         );
         assert_eq!(store.latest_context_usage("other").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn latest_context_usage_skips_compaction_calls_with_empty_tools() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("test.db").display()
+        ))
+        .await
+        .unwrap();
+
+        for (call_id, tool_count, context_input_tokens, message_count) in [
+            ("conversation-call", 4_i64, 40_000_u64, 3_usize),
+            ("compaction-call", 0, 95_000, 6),
+        ] {
+            store
+                .start_llm_call(&NewLlmCall {
+                    call_id: call_id.into(),
+                    run_id: format!("run-{call_id}"),
+                    conversation_id: "conversation".into(),
+                    provider_call_index: 0,
+                    model_hash: "model".into(),
+                    provider_type: ProviderType::Plugin,
+                    provider_url: "plugin://test".into(),
+                    request_type: ProviderType::Plugin,
+                    request_url: "plugin://test".into(),
+                    model_id: "model".into(),
+                    display_name: "model".into(),
+                    reasoning_effort: None,
+                    fast: false,
+                    message_count,
+                    tool_count: tool_count as usize,
+                    detailed: false,
+                })
+                .await
+                .unwrap();
+            store
+                .record_llm_usage(
+                    call_id,
+                    Usage {
+                        input_tokens: Some(context_input_tokens),
+                        context_input_tokens: Some(context_input_tokens),
+                        output_tokens: Some(10),
+                        total_tokens: Some(context_input_tokens + 10),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.latest_context_usage("conversation").await.unwrap(),
+            Some(ContextUsageAnchor {
+                context_input_tokens: 40_000,
+                message_count: 3,
+            })
+        );
     }
 }

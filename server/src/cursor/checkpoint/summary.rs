@@ -16,6 +16,7 @@ impl CheckpointBuilder {
         messages: &[CanonicalMessage],
         mode: i32,
         summary: &str,
+        window_tail: u32,
         presentation: &PendingSteps,
     ) -> Result<pb::ConversationStateStructure> {
         let summarized = self
@@ -45,7 +46,7 @@ impl CheckpointBuilder {
         let archive = pb::ConversationSummaryArchive {
             summarized_messages: summarized.iter().map(|id| id.as_bytes().to_vec()).collect(),
             summary: summary.into(),
-            window_tail: 0,
+            window_tail,
             summary_message: summary_message.as_bytes().to_vec(),
         };
         let mut edges = summarized

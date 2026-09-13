@@ -4,8 +4,9 @@ use std::collections::HashSet;
 
 use crate::{
     model::{
-        estimate_context_tokens, estimate_projected_messages_tokens, CanonicalMessage, PreparedRun,
-        ProjectedContent, ProjectedMessage, Role,
+        estimate_context_tokens, estimate_projected_messages_tokens, project_messages,
+        CanonicalMessage, ContentPart, MessageContent, Origin, PreparedRun, ProjectedContent,
+        ProjectedMessage, Role,
     },
     store::ContextUsageAnchor,
 };
@@ -64,8 +65,9 @@ pub(super) fn is_context_overflow(message: &str) -> bool {
 /// Either failure falls back to the truncated summary, which is usually still
 /// too large, so the conversation stays over its window and cannot recover.
 ///
-/// Trimming keeps the most recent turns and only ever cuts at a user-message
-/// boundary, so an assistant tool call is never separated from its results.
+/// Trimming keeps the oldest turns of the dropped prefix and only ever cuts at
+/// a user-message boundary, so an assistant tool call is never separated from
+/// its results. Recent turns belong in `window_tail`, not in the summarizer.
 pub(super) fn compaction_history(
     history: Vec<ProjectedMessage>,
     context_window: Option<u64>,
@@ -92,27 +94,35 @@ fn trim_to_context(
     if estimate_projected_messages_tokens(&history) <= budget {
         return history;
     }
-    // Walk back from the newest turn, keeping whole user-delimited turns.
-    let mut kept = 0;
-    let mut newest_turn = None;
-    for (index, message) in history.iter().enumerate().rev() {
+    // Walk forward from the oldest turn, keeping whole user-delimited turns.
+    let mut end = 0;
+    for (index, message) in history.iter().enumerate() {
         if !is_turn_boundary(message) {
             continue;
         }
-        newest_turn.get_or_insert(index);
-        if estimate_projected_messages_tokens(&history[index..]) > budget {
+        if index > 0 && estimate_projected_messages_tokens(&history[..index]) > budget {
             break;
         }
-        kept = history.len() - index;
+        if index > 0 {
+            end = index;
+        }
     }
-    if kept == 0 {
-        // Not even the newest turn fits. Keep it anyway rather than sending an
+    if end == 0 {
+        // Not even the oldest turn fits. Keep it anyway rather than sending an
         // empty history: an empty summarize call returns a summary of nothing
         // that would then replace the whole conversation.
-        let start = newest_turn.unwrap_or(0);
-        return history.split_off(start);
+        let next = history
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, message)| is_turn_boundary(message))
+            .map(|(index, _)| index)
+            .unwrap_or(history.len());
+        history.truncate(next);
+        return history;
     }
-    history.split_off(history.len() - kept)
+    history.truncate(end);
+    history
 }
 
 fn is_turn_boundary(message: &ProjectedMessage) -> bool {
@@ -194,17 +204,260 @@ pub(super) fn partition(
     (compactable, retained)
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum CompactionKind {
+    Auto,
+    Manual,
+}
+
+/// Cursor-style window: summarize the obsolete prefix, keep a recent tail.
+///
+/// Local Cursor 3.20.17 agent-host `partitionMessages` keeps the last user
+/// turn as `preservedTailMessages` and puts earlier turns (file bubbles, Read
+/// results) in `messagesToSummarize`. Composer then stops resending those
+/// bubbles at `truncation_last_bubble_id_inclusive`. BYOK inlines the same
+/// files into `<selected_context>` / Read results, so a token-budget tail
+/// would still carry them; the first pass peels that file window into the
+/// prefix instead of leaving it in `window_tail` or current initial.
+pub(super) struct CompactionPlan {
+    pub prefix: Vec<CanonicalMessage>,
+    pub tail: Vec<CanonicalMessage>,
+    pub retained_request_context: Option<CanonicalMessage>,
+}
+
+impl CompactionPlan {
+    pub(super) fn window_tail(&self) -> u32 {
+        self.tail.len().min(u32::MAX as usize) as u32
+    }
+}
+
+pub(super) fn plan(
+    messages: &[CanonicalMessage],
+    current_ids: &HashSet<&str>,
+    prepared: &PreparedRun,
+    kind: CompactionKind,
+) -> Option<CompactionPlan> {
+    let (compactable, retained_request_context) = partition(messages, current_ids);
+    let current_file_windows = prepared
+        .initial_messages
+        .iter()
+        .filter(|message| is_file_window(message))
+        .cloned()
+        .collect::<Vec<_>>();
+    if compactable.is_empty() && current_file_windows.is_empty() {
+        return None;
+    }
+    let tail_start = tail_start_index(
+        &compactable,
+        tail_token_budget(prepared, retained_request_context.as_ref()),
+    );
+    let compactable_has_file_window = compactable.iter().any(is_file_window);
+    let (mut prefix, mut tail) = if compactable.is_empty() {
+        (Vec::new(), Vec::new())
+    } else if tail_start == 0 {
+        match kind {
+            CompactionKind::Auto
+                if current_file_windows.is_empty() && !compactable_has_file_window =>
+            {
+                return None;
+            }
+            CompactionKind::Auto => (Vec::new(), compactable),
+            CompactionKind::Manual => (compactable, Vec::new()),
+        }
+    } else {
+        let mut compactable = compactable;
+        let tail = compactable.split_off(tail_start);
+        (compactable, tail)
+    };
+    peel_file_windows(&mut prefix, &mut tail);
+    prefix.extend(current_file_windows);
+    if prefix.is_empty() {
+        return None;
+    }
+    Some(CompactionPlan {
+        prefix,
+        tail,
+        retained_request_context,
+    })
+}
+
+pub(super) fn summary_message(event_id: String, summary: &str) -> CanonicalMessage {
+    CanonicalMessage {
+        message_id: format!("runtime:{event_id}"),
+        role: Role::User,
+        origin: Origin::Runtime,
+        content: MessageContent::Parts {
+            parts: vec![ContentPart::Text {
+                text: format!("<conversation_summary>\n{summary}\n</conversation_summary>"),
+            }],
+        },
+        runtime_event_id: Some(event_id),
+    }
+}
+
+pub(super) fn replacement(
+    plan: &CompactionPlan,
+    summary: CanonicalMessage,
+    initial: &[CanonicalMessage],
+) -> Vec<CanonicalMessage> {
+    let mut messages = Vec::with_capacity(
+        usize::from(plan.retained_request_context.is_some()) + 1 + plan.tail.len() + initial.len(),
+    );
+    if let Some(context) = &plan.retained_request_context {
+        messages.push(context.clone());
+    }
+    messages.push(summary);
+    messages.extend(plan.tail.iter().cloned());
+    messages.extend(initial.iter().cloned().map(|message| {
+        if is_file_window(&message) {
+            shrink_file_window(message)
+        } else {
+            message
+        }
+    }));
+    messages
+}
+
+const COMPACTED_FILE_WINDOW: &str = "[compacted file window]";
+
+fn is_file_window(message: &CanonicalMessage) -> bool {
+    match &message.content {
+        MessageContent::Parts { parts } => parts.iter().any(|part| match part {
+            ContentPart::Text { text } => contains_selected_file_window(text),
+            _ => false,
+        }),
+        MessageContent::ToolResult(result) => {
+            result.name == "Read"
+                && !result.content.is_empty()
+                && result.content != COMPACTED_FILE_WINDOW
+        }
+        MessageContent::Assistant { .. } => false,
+    }
+}
+
+fn contains_selected_file_window(text: &str) -> bool {
+    let Some(start) = text.find("<selected_context>") else {
+        return false;
+    };
+    let Some(relative_end) = text[start..].find("</selected_context>") else {
+        return false;
+    };
+    let block = &text[start..start + relative_end];
+    block.contains("<file") || block.contains("<code ")
+}
+
+fn peel_file_windows(prefix: &mut Vec<CanonicalMessage>, tail: &mut Vec<CanonicalMessage>) {
+    let mut kept = Vec::with_capacity(tail.len());
+    for message in tail.drain(..) {
+        if is_file_window(&message) {
+            prefix.push(message.clone());
+            kept.push(shrink_file_window(message));
+        } else {
+            kept.push(message);
+        }
+    }
+    *tail = kept;
+}
+
+fn shrink_file_window(mut message: CanonicalMessage) -> CanonicalMessage {
+    match &mut message.content {
+        MessageContent::Parts { parts } => {
+            for part in parts {
+                if let ContentPart::Text { text } = part {
+                    *text = strip_selected_context(text);
+                }
+            }
+        }
+        MessageContent::ToolResult(result) if result.name == "Read" => {
+            result.content = COMPACTED_FILE_WINDOW.into();
+        }
+        _ => {}
+    }
+    message
+}
+
+fn strip_selected_context(text: &str) -> String {
+    let mut remaining = text;
+    let mut output = String::new();
+    while let Some(start) = remaining.find("<selected_context>") {
+        output.push_str(remaining[..start].trim_end());
+        let Some(relative_end) = remaining[start..].find("</selected_context>") else {
+            output.push_str(remaining[start..].trim_start());
+            return output;
+        };
+        remaining = remaining[start + relative_end + "</selected_context>".len()..].trim_start();
+        if !output.is_empty() && !remaining.is_empty() {
+            output.push_str("\n\n");
+        }
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn tail_token_budget(
+    prepared: &PreparedRun,
+    retained_request_context: Option<&CanonicalMessage>,
+) -> Option<u64> {
+    let budget = input_budget(prepared)?;
+    let mut held = Vec::new();
+    if let Some(context) = retained_request_context {
+        held.push(context.clone());
+    }
+    held.extend(prepared.initial_messages.iter().cloned());
+    let held_tokens = project_messages(&held)
+        .map(|projected| estimate_context_tokens(&prepared.prompt, &projected))
+        .unwrap_or(0);
+    Some(
+        budget
+            .saturating_sub(held_tokens)
+            .saturating_sub(OUTPUT_TOKENS),
+    )
+}
+
+fn tail_start_index(compactable: &[CanonicalMessage], tail_budget: Option<u64>) -> usize {
+    if compactable.is_empty() {
+        return 0;
+    }
+    let Some(budget) = tail_budget else {
+        return last_turn_start(compactable);
+    };
+    if budget == 0 {
+        return compactable.len();
+    }
+    let Ok(projected) = project_messages(compactable) else {
+        return compactable.len();
+    };
+    let mut start = compactable.len();
+    for (index, message) in compactable.iter().enumerate().rev() {
+        if !is_canonical_turn_boundary(message) {
+            continue;
+        }
+        if estimate_projected_messages_tokens(&projected[index..]) > budget {
+            break;
+        }
+        start = index;
+    }
+    start
+}
+
+fn last_turn_start(compactable: &[CanonicalMessage]) -> usize {
+    compactable
+        .iter()
+        .rposition(is_canonical_turn_boundary)
+        .unwrap_or(0)
+}
+
+fn is_canonical_turn_boundary(message: &CanonicalMessage) -> bool {
+    message.role == Role::User && matches!(message.content, MessageContent::Parts { .. })
+}
+
 pub(super) fn fallback_summary(messages: &[CanonicalMessage]) -> String {
     let serialized = serde_json::to_string(messages).unwrap_or_default();
-    let start = serialized
+    let end = serialized
         .char_indices()
-        .rev()
         .nth(FALLBACK_CHARS.saturating_sub(1))
-        .map_or(0, |(index, _)| index);
-    format!(
-        "Durable recent conversation state:\n{}",
-        &serialized[start..]
-    )
+        .map_or(serialized.len(), |(index, _)| index);
+    format!("Durable conversation state:\n{}", &serialized[..end])
 }
 
 #[cfg(test)]
@@ -355,8 +608,9 @@ mod tests {
 
     #[test]
     fn compaction_history_is_trimmed_to_fit_the_context_window() {
-        // Compaction runs because the conversation is too large, so the
-        // summarize call must not replay a prompt that is over the window.
+        // The summarizer sees the dropped prefix. If that prefix is itself over
+        // the window, keep the oldest turns: goals live there, and the newest
+        // turns are already retained as window_tail.
         let big = "x".repeat(400_000);
         let history = vec![
             user("u1", &big),
@@ -368,28 +622,218 @@ mod tests {
         let prepared = compaction_history(history, Some(window));
 
         let budget = context_budget(window) - OUTPUT_TOKENS;
-        assert!(estimate_projected_messages_tokens(&prepared) <= budget);
+        assert!(
+            estimate_projected_messages_tokens(&prepared) <= budget
+                || prepared.iter().any(|message| message.message_id == "u1")
+        );
         assert_eq!(prepared.last().unwrap().role, Role::User);
-        // The newest turn survives the trim and is never split.
-        assert!(prepared.iter().any(|message| message.message_id == "u2"));
-        assert!(prepared.iter().any(|message| message.message_id == "a2"));
-        assert!(!prepared.iter().any(|message| message.message_id == "u1"));
+        assert!(prepared.iter().any(|message| message.message_id == "u1"));
+        assert!(!prepared.iter().any(|message| message.message_id == "u2"));
     }
 
     #[test]
-    fn compaction_history_keeps_the_newest_turn_even_when_it_is_over_budget() {
-        // A history whose newest turn alone exceeds the budget is still sent
+    fn compaction_history_keeps_the_oldest_turn_even_when_it_is_over_budget() {
+        // A prefix whose oldest turn alone exceeds the budget is still sent
         // rather than trimmed to nothing: a summary of nothing would replace
         // the whole conversation.
         let history = vec![
-            user("u1", "old"),
+            user("u1", &"x".repeat(400_000)),
             assistant("a1", "old answer"),
-            user("u2", &"x".repeat(400_000)),
+            user("u2", "recent"),
             assistant("a2", "answer"),
         ];
         let prepared = compaction_history(history, Some(50_000));
-        assert_eq!(prepared[0].message_id, "u2");
+        assert_eq!(prepared[0].message_id, "u1");
+        assert!(!prepared.iter().any(|message| message.message_id == "u2"));
         assert_eq!(prepared.last().unwrap().role, Role::User);
+    }
+
+    fn ids(messages: &[CanonicalMessage]) -> HashSet<&str> {
+        messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn auto_plan_keeps_a_recent_turn_as_window_tail() {
+        let old = CanonicalMessage::text("u1", Role::User, Origin::Runtime, "x".repeat(200_000));
+        let old_answer = CanonicalMessage::text("a1", Role::Assistant, Origin::Assistant, "old");
+        let recent = CanonicalMessage::text("u2", Role::User, Origin::Runtime, "recent work");
+        let recent_answer =
+            CanonicalMessage::text("a2", Role::Assistant, Origin::Assistant, "done");
+        let current = CanonicalMessage::text("u3", Role::User, Origin::Runtime, "continue");
+        let messages = vec![old, old_answer, recent, recent_answer, current.clone()];
+        let current_ids = ids(std::slice::from_ref(&current));
+        let mut prepared = prepared(50_000);
+        prepared.initial_messages = vec![current.clone()];
+
+        let plan = plan(&messages, &current_ids, &prepared, CompactionKind::Auto).unwrap();
+        assert_eq!(
+            plan.prefix
+                .iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["u1", "a1"]
+        );
+        assert_eq!(
+            plan.tail
+                .iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["u2", "a2"]
+        );
+        assert_eq!(plan.window_tail(), 2);
+        let assembled = replacement(&plan, summary_message("s".into(), "goals and files"), &[]);
+        assert_eq!(assembled[0].message_id, "runtime:s");
+        assert_eq!(assembled[1].message_id, "u2");
+    }
+
+    #[test]
+    fn auto_plan_skips_when_the_compactable_dialogue_already_fits_in_the_tail() {
+        let context = CanonicalMessage::text(
+            "request-context:rules",
+            Role::User,
+            Origin::Runtime,
+            "x".repeat(80_000),
+        );
+        let user = CanonicalMessage::text("u1", Role::User, Origin::Runtime, "hi");
+        let assistant = CanonicalMessage::text("a1", Role::Assistant, Origin::Assistant, "hello");
+        let current = CanonicalMessage::text("u2", Role::User, Origin::Runtime, "again");
+        let messages = vec![context, user, assistant, current.clone()];
+        let current_ids = ids(std::slice::from_ref(&current));
+        let mut prepared = prepared(200_000);
+        prepared.initial_messages = vec![current.clone()];
+
+        assert!(plan(&messages, &current_ids, &prepared, CompactionKind::Auto).is_none());
+    }
+
+    fn file_window_user(id: &str, query: &str, body: &str) -> CanonicalMessage {
+        CanonicalMessage::text(
+            id,
+            Role::User,
+            Origin::Runtime,
+            format!(
+                "<selected_context>\n<file path=\"src/big.rs\">\n{body}\n</file>\n</selected_context>\n\n<user_query>\n{query}\n</user_query>"
+            ),
+        )
+    }
+
+    #[test]
+    fn auto_plan_moves_selected_context_file_window_into_the_prefix() {
+        // Cursor 3.20.17 drops file-bearing bubbles via
+        // truncation_last_bubble_id_inclusive. A token-budget tail would keep
+        // this dump because it still fits, which is the 96% first-pass leftover.
+        let old = CanonicalMessage::text("u1", Role::User, Origin::Runtime, "x".repeat(200_000));
+        let old_answer = CanonicalMessage::text("a1", Role::Assistant, Origin::Assistant, "old");
+        let files = file_window_user("u2", "recent work", &"secret-file-body".repeat(8_000));
+        let files_answer =
+            CanonicalMessage::text("a2", Role::Assistant, Origin::Assistant, "noted");
+        let current = CanonicalMessage::text("u3", Role::User, Origin::Runtime, "continue");
+        let messages = vec![old, old_answer, files, files_answer, current.clone()];
+        let current_ids = ids(std::slice::from_ref(&current));
+        let mut prepared = prepared(200_000);
+        prepared.initial_messages = vec![current.clone()];
+
+        let plan = plan(&messages, &current_ids, &prepared, CompactionKind::Auto).unwrap();
+        assert!(
+            plan.prefix.iter().any(|message| {
+                message.message_id == "u2" && message_text(message).contains("secret-file-body")
+            }),
+            "summarizer must see the file window"
+        );
+        assert!(
+            plan.tail.iter().any(|message| message.message_id == "u2"),
+            "recent query stays in the tail"
+        );
+        assert!(
+            plan.tail
+                .iter()
+                .all(|message| !message_text(message).contains("secret-file-body")),
+            "tail must not keep file bodies"
+        );
+        let assembled = replacement(
+            &plan,
+            summary_message("s".into(), "files were summarized"),
+            &prepared.initial_messages,
+        );
+        assert!(assembled
+            .iter()
+            .all(|message| !message_text(message).contains("secret-file-body")));
+        assert!(assembled.iter().any(|message| message.message_id == "u2"));
+        assert!(assembled.iter().any(|message| message.message_id == "u3"));
+    }
+
+    #[test]
+    fn replacement_strips_file_window_from_current_initial() {
+        let old = CanonicalMessage::text("u1", Role::User, Origin::Runtime, "x".repeat(200_000));
+        let old_answer = CanonicalMessage::text("a1", Role::Assistant, Origin::Assistant, "old");
+        let current = file_window_user("u2", "continue", &"current-file-body".repeat(8_000));
+        let messages = vec![old, old_answer, current.clone()];
+        let current_ids = ids(std::slice::from_ref(&current));
+        let mut prepared = prepared(50_000);
+        prepared.initial_messages = vec![current.clone()];
+
+        let plan = plan(&messages, &current_ids, &prepared, CompactionKind::Auto).unwrap();
+        assert!(plan.prefix.iter().any(|message| {
+            message.message_id == "u2" && message_text(message).contains("current-file-body")
+        }));
+        let assembled = replacement(
+            &plan,
+            summary_message("s".into(), "current files summarized"),
+            &prepared.initial_messages,
+        );
+        let slim = assembled
+            .iter()
+            .find(|message| message.message_id == "u2")
+            .unwrap();
+        assert!(message_text(slim).contains("continue"));
+        assert!(!message_text(slim).contains("current-file-body"));
+        assert!(!message_text(slim).contains("<selected_context>"));
+    }
+
+    fn message_text(message: &CanonicalMessage) -> String {
+        match &message.content {
+            MessageContent::Parts { parts } => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+            MessageContent::ToolResult(result) => result.content.clone(),
+            MessageContent::Assistant { text, .. } => text.clone(),
+        }
+    }
+
+    #[test]
+    fn manual_plan_summarizes_a_single_turn_when_there_is_no_tail() {
+        let user = CanonicalMessage::text("u1", Role::User, Origin::Runtime, "remember alpha");
+        let assistant =
+            CanonicalMessage::text("a1", Role::Assistant, Origin::Assistant, "old answer");
+        let messages = vec![user, assistant];
+        let prepared = prepared(200_000);
+        let plan = plan(
+            &messages,
+            &HashSet::new(),
+            &prepared,
+            CompactionKind::Manual,
+        )
+        .unwrap();
+        assert_eq!(plan.prefix.len(), 2);
+        assert!(plan.tail.is_empty());
+        assert_eq!(plan.window_tail(), 0);
+    }
+
+    #[test]
+    fn fallback_summary_keeps_the_oldest_prefix_bytes() {
+        let messages = vec![
+            CanonicalMessage::text("u1", Role::User, Origin::Runtime, "alpha-goal"),
+            CanonicalMessage::text("u2", Role::User, Origin::Runtime, "z".repeat(20_000)),
+        ];
+        let fallback = fallback_summary(&messages);
+        assert!(fallback.contains("alpha-goal"));
     }
 
     #[test]

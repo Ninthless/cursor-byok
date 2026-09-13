@@ -199,28 +199,52 @@ impl RunEngine {
                 })
                 .flatten();
             if let Some(estimated_tokens) = compaction_estimate {
-                if emit(
-                    client,
-                    RunEvent::UsageSnapshot(context_usage_snapshot(estimated_tokens)),
-                )
-                .await
-                .is_err()
-                {
-                    return (client_failure(), usage);
-                }
-                match self
-                    .auto_compact(prepared, checkpoint, &messages, client, cancellation)
-                    .await
-                {
-                    Ok((next_checkpoint, compaction_usage)) => {
-                        checkpoint = next_checkpoint;
-                        context_usage_anchor = None;
-                        if let Some(compaction_usage) = compaction_usage {
-                            accumulate_usage(&mut usage, compaction_usage);
+                let current_ids = prepared
+                    .initial_messages
+                    .iter()
+                    .map(|message| message.message_id.as_str())
+                    .collect::<HashSet<_>>();
+                match super::compaction::plan(
+                    &messages,
+                    &current_ids,
+                    prepared,
+                    super::compaction::CompactionKind::Auto,
+                ) {
+                    None => {
+                        // Auto skips when there is no obsolete prefix. If the
+                        // current input already exceeds the window, summarizing
+                        // a tail that fits cannot help and must not dispatch.
+                        if let Err(message) =
+                            super::compaction::validate_compacted(prepared, &history)
+                        {
+                            return (RunOutcome::Failed(RunFailure::Protocol(message)), usage);
                         }
-                        continue 'model;
                     }
-                    Err(outcome) => return (outcome, usage),
+                    Some(plan) => {
+                        if emit(
+                            client,
+                            RunEvent::UsageSnapshot(context_usage_snapshot(estimated_tokens)),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return (client_failure(), usage);
+                        }
+                        match self
+                            .auto_compact(prepared, checkpoint, plan, client, cancellation)
+                            .await
+                        {
+                            Ok((next_checkpoint, compaction_usage)) => {
+                                checkpoint = next_checkpoint;
+                                context_usage_anchor = None;
+                                if let Some(compaction_usage) = compaction_usage {
+                                    accumulate_usage(&mut usage, compaction_usage);
+                                }
+                                continue 'model;
+                            }
+                            Err(outcome) => return (outcome, usage),
+                        }
+                    }
                 }
             }
             let provider_call_index = match self.store.begin_provider_call(&prepared.run_id).await {
@@ -239,12 +263,30 @@ impl RunEngine {
             // The usage anchor counts persisted messages only; a transient
             // tail is provider-visible but never committed.
             let anchored_messages = history.len();
+            let mut compact_plan = None;
             let history = if prepared.action == RunAction::Compact {
-                super::history::user_terminated(
-                    history,
-                    "compaction:instruction",
-                    super::compaction::INSTRUCTIONS,
-                )
+                let Some(plan) = super::compaction::plan(
+                    &messages,
+                    &HashSet::new(),
+                    prepared,
+                    super::compaction::CompactionKind::Manual,
+                ) else {
+                    return (
+                        RunOutcome::Failed(RunFailure::Protocol(
+                            "compaction produced no conversation prefix to summarize".into(),
+                        )),
+                        usage,
+                    );
+                };
+                let prefix = match crate::model::project_messages(&plan.prefix) {
+                    Ok(history) => super::compaction::compaction_history(
+                        history,
+                        prepared.model.context_window_tokens,
+                    ),
+                    Err(error) => return (RunOutcome::Failed(error.into()), usage),
+                };
+                compact_plan = Some(plan);
+                prefix
             } else {
                 super::history::user_terminated(history, CONTINUE_MESSAGE_ID, CONTINUE_INSTRUCTION)
             };
@@ -420,8 +462,35 @@ impl RunEngine {
                                     Ok(messages) => messages,
                                     Err(error) => return (RunOutcome::Failed(error.into()), usage),
                                 };
+                            let current_ids = prepared
+                                .initial_messages
+                                .iter()
+                                .map(|message| message.message_id.as_str())
+                                .collect::<HashSet<_>>();
+                            let Some(plan) = super::compaction::plan(
+                                &messages,
+                                &current_ids,
+                                prepared,
+                                super::compaction::CompactionKind::Auto,
+                            )
+                            .or_else(|| {
+                                super::compaction::plan(
+                                    &messages,
+                                    &current_ids,
+                                    prepared,
+                                    super::compaction::CompactionKind::Manual,
+                                )
+                            }) else {
+                                return (
+                                    RunOutcome::Failed(RunFailure::Protocol(
+                                        "context overflow after compaction: no conversation history can be compacted"
+                                            .into(),
+                                    )),
+                                    usage,
+                                );
+                            };
                             match self
-                                .auto_compact(prepared, checkpoint, &messages, client, cancellation)
+                                .auto_compact(prepared, checkpoint, plan, client, cancellation)
                                 .await
                             {
                                 Ok((next_checkpoint, compaction_usage)) => {
@@ -530,11 +599,13 @@ impl RunEngine {
                 }
             };
             if let Some(cycle_usage) = cycle.usage {
-                update_context_usage_anchor(
-                    &mut context_usage_anchor,
-                    cycle_usage,
-                    anchored_messages,
-                );
+                if prepared.action != RunAction::Compact {
+                    update_context_usage_anchor(
+                        &mut context_usage_anchor,
+                        cycle_usage,
+                        anchored_messages,
+                    );
+                }
                 accumulate_usage(&mut usage, cycle_usage);
             }
 
@@ -556,27 +627,23 @@ impl RunEngine {
                         usage,
                     );
                 }
+                let plan = compact_plan
+                    .take()
+                    .expect("compact plan is set before the compact model call");
+                let window_tail = plan.window_tail();
                 let event_id = format!("summary:{}", prepared.run_id);
-                let summary_message = CanonicalMessage {
-                    message_id: format!("runtime:{event_id}"),
-                    role: Role::User,
-                    origin: Origin::Runtime,
-                    content: MessageContent::Parts {
-                        parts: vec![crate::model::ContentPart::Text {
-                            text: format!(
-                                "<conversation_summary>\n{summary}\n</conversation_summary>"
-                            ),
-                        }],
-                    },
-                    runtime_event_id: Some(event_id),
-                };
+                let replacement = super::compaction::replacement(
+                    &plan,
+                    super::compaction::summary_message(event_id, &summary),
+                    &prepared.initial_messages,
+                );
                 checkpoint = match self
                     .store
                     .replace_checkpoint(
                         &prepared.conversation_id,
                         &prepared.run_id,
                         checkpoint,
-                        &[summary_message],
+                        &replacement,
                     )
                     .await
                 {
@@ -624,7 +691,10 @@ impl RunEngine {
                     RunEvent::MessagesCommitted(MessagesCommitted {
                         checkpoint_id: checkpoint,
                         tool_round_version: 0,
-                        cause: CommitCause::Compaction { summary },
+                        cause: CommitCause::Compaction {
+                            summary,
+                            window_tail,
+                        },
                         barrier,
                     }),
                 )
@@ -763,29 +833,10 @@ impl RunEngine {
         &self,
         prepared: &PreparedRun,
         checkpoint: crate::model::CheckpointId,
-        messages: &[CanonicalMessage],
+        plan: super::compaction::CompactionPlan,
         client: &mut RunPort,
         cancellation: &CancellationToken,
     ) -> std::result::Result<(crate::model::CheckpointId, Option<Usage>), RunOutcome> {
-        let current_ids = prepared
-            .initial_messages
-            .iter()
-            .map(|message| message.message_id.as_str())
-            .collect::<HashSet<_>>();
-        let (compactable, retained_request_context) =
-            super::compaction::partition(messages, &current_ids);
-        if compactable.is_empty() {
-            let projected = crate::model::project_messages(messages)
-                .map_err(|error| RunOutcome::Failed(error.into()))?;
-            let message = super::compaction::validate_compacted(prepared, &projected)
-                .err()
-                .unwrap_or_else(|| {
-                    "context overflow after compaction: no conversation history can be compacted"
-                        .into()
-                });
-            return Err(RunOutcome::Failed(RunFailure::Protocol(message)));
-        }
-
         emit(client, RunEvent::AutoCompactionStarted)
             .await
             .map_err(|_| client_failure())?;
@@ -794,7 +845,7 @@ impl RunEngine {
             .begin_provider_call(&prepared.run_id)
             .await
             .map_err(|error| RunOutcome::Failed(error.into()))?;
-        let history = crate::model::project_messages(&compactable)
+        let history = crate::model::project_messages(&plan.prefix)
             .map(|history| {
                 super::compaction::compaction_history(history, prepared.model.context_window_tokens)
             })
@@ -867,11 +918,11 @@ impl RunEngine {
         let _ = drain.await;
         let (summary, compaction_usage) = match (break_messages.is_some(), cycle) {
             (true, Ok(cycle)) => (
-                super::compaction::fallback_summary(&compactable),
+                super::compaction::fallback_summary(&plan.prefix),
                 cycle.usage,
             ),
             (true, Err(failure)) => (
-                super::compaction::fallback_summary(&compactable),
+                super::compaction::fallback_summary(&plan.prefix),
                 failure.usage,
             ),
             (false, Ok(cycle)) if cycle.calls.is_empty() && !cycle.text.trim().is_empty() => {
@@ -880,33 +931,25 @@ impl RunEngine {
             (false, Ok(cycle)) => {
                 tracing::warn!("automatic compaction returned no usable summary; using fallback");
                 (
-                    super::compaction::fallback_summary(&compactable),
+                    super::compaction::fallback_summary(&plan.prefix),
                     cycle.usage,
                 )
             }
             (false, Err(failure)) => {
                 tracing::warn!(error = ?failure.failure, "automatic compaction model failed; using fallback");
                 (
-                    super::compaction::fallback_summary(&compactable),
+                    super::compaction::fallback_summary(&plan.prefix),
                     failure.usage,
                 )
             }
         };
+        let window_tail = plan.window_tail();
         let event_id = format!("summary:auto:{}:{provider_call_index}", prepared.run_id);
-        let summary_message = CanonicalMessage {
-            message_id: format!("runtime:{event_id}"),
-            role: Role::User,
-            origin: Origin::Runtime,
-            content: MessageContent::Parts {
-                parts: vec![crate::model::ContentPart::Text {
-                    text: format!("<conversation_summary>\n{summary}\n</conversation_summary>"),
-                }],
-            },
-            runtime_event_id: Some(event_id),
-        };
-        let mut replacement = retained_request_context.into_iter().collect::<Vec<_>>();
-        replacement.push(summary_message);
-        replacement.extend(prepared.initial_messages.iter().cloned());
+        let replacement = super::compaction::replacement(
+            &plan,
+            super::compaction::summary_message(event_id, &summary),
+            &prepared.initial_messages,
+        );
         let projected_replacement = crate::model::project_messages(&replacement)
             .map_err(|error| RunOutcome::Failed(error.into()))?;
         super::compaction::validate_compacted(prepared, &projected_replacement)
@@ -927,7 +970,10 @@ impl RunEngine {
             RunEvent::MessagesCommitted(MessagesCommitted {
                 checkpoint_id: checkpoint,
                 tool_round_version: 0,
-                cause: CommitCause::Compaction { summary },
+                cause: CommitCause::Compaction {
+                    summary,
+                    window_tail,
+                },
                 barrier,
             }),
         )

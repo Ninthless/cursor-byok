@@ -414,6 +414,86 @@ async fn incremental_preflight_uses_conversation_anchor_across_model_switch() {
 }
 
 #[tokio::test]
+async fn summarize_usage_does_not_trigger_the_next_turn_to_compact() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let model = store
+        .create_model(&windowed_model("summarize-anchor-model", Some(100_000)))
+        .await
+        .unwrap();
+    let provider = fake_provider::FakeProvider::default();
+    provider.push(text_response("old answer", 4_000, 12));
+    provider.push(vec![
+        ModelEvent::Start {
+            model_call_id: "summary-call".into(),
+        },
+        ModelEvent::TextStart,
+        ModelEvent::TextDelta("Durable summary".into()),
+        ModelEvent::TextEnd,
+        ModelEvent::Usage(Usage {
+            input_tokens: Some(95_000),
+            context_input_tokens: Some(95_000),
+            output_tokens: Some(9),
+            total_tokens: Some(95_009),
+            ..Default::default()
+        }),
+        ModelEvent::Done(FinishReason::Stop),
+    ]);
+    provider.push(text_response("still here", 900, 5));
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let registry = TransportRegistry::new(
+        store,
+        Arc::new(provider.clone()),
+        PromptCompiler::new(assets),
+    );
+
+    let first = run(
+        &registry,
+        "anchor-first",
+        user_request(
+            "summarize-anchor",
+            "user-1",
+            "remember alpha",
+            &model.model_hash,
+            None,
+        ),
+    )
+    .await;
+    let compacted = run(
+        &registry,
+        "anchor-compact",
+        summary_request(
+            "summarize-anchor",
+            &model.model_hash,
+            first.checkpoints.last().unwrap().clone(),
+        ),
+    )
+    .await;
+    assert_eq!(compacted.summary_started, 1);
+    assert_eq!(compacted.summary_completed, 1);
+
+    let after = run(
+        &registry,
+        "anchor-after",
+        user_request(
+            "summarize-anchor",
+            "user-2",
+            "what remains?",
+            &model.model_hash,
+            compacted.checkpoints.last().cloned(),
+        ),
+    )
+    .await;
+    assert_eq!(after.summary_started, 0);
+    assert_eq!(after.summary_completed, 0);
+    assert_eq!(provider.requests().len(), 3);
+}
+
+#[tokio::test]
 async fn irreducibly_oversized_current_input_fails_before_provider_dispatch() {
     let (_directory, store) = fixtures::temp_store().await;
     let model = store
